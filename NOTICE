@@ -1,0 +1,15 @@
+vLLM SM120 NVFP4-KV + MTP community release
+
+Copyright 2026 Sean Your Highness and contributors.
+
+This distribution contains modifications to vLLM v0.27.1, licensed under the
+Apache License, Version 2.0. The source overlay is provided as
+0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch. Upstream:
+https://github.com/vllm-project/vllm
+
+The default model is not included in this repository or runtime image:
+gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090. It is downloaded directly from
+Hugging Face at the revision recorded in .env.example and is Apache-2.0.
+
+This project is not affiliated with or endorsed by the vLLM project, NVIDIA,
+Qwen, or Hugging Face.

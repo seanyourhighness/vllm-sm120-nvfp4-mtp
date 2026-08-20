@@ -1,0 +1,1152 @@
+diff --git a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+index 693d55f..df6779b 100644
+--- a/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
++++ b/csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu
+@@ -153,12 +153,19 @@ __global__ void reshape_and_cache_nvfp4_kernel(
+ #endif
+
+       // Write block scale to scale cache.
+-      // K (kv==0): linear layout (no swizzle).
+-      // V (kv==1): swizzled layout for SM100 trtllm-gen MHA kernel.
++      // SM100 trtllm-gen requires swizzled V scales. SM120 XQA consumes
++      // ordinary tensor strides for both K and V scales, so both must be
++      // linear there.
+       if (sf_out_ptr != nullptr) {
+         int scale_idx = group_in_head;
+         uint8_t* __restrict__ scale_dst;
+-        if (kv == 0) {
++#if defined(__CUDA_ARCH__) && \
++    (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
++        constexpr bool swizzle_v_scale = false;
++#else
++        constexpr bool swizzle_v_scale = true;
++#endif
++        if (kv == 0 || !swizzle_v_scale) {
+           scale_dst = scale_block + head * scale_head_stride +
+                       block_offset * scale_block_offset_stride + scale_idx;
+         } else {
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index d6e5579..bae9161 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1140,7 +1140,15 @@ class VllmConfig:
+                 )
+                 self.scheduler_config.async_scheduling = False
+             else:
+-                self.scheduler_config.async_scheduling = True
++                if os.environ.get("VLLM_DISABLE_ASYNC_SCHEDULING"):
++                    logger.warning_once(
++                        "Async scheduling disabled by "
++                        "VLLM_DISABLE_ASYNC_SCHEDULING (required for MTP + "
++                        "structured output on this branch)."
++                    )
++                    self.scheduler_config.async_scheduling = False
++                else:
++                    self.scheduler_config.async_scheduling = True
+
+         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
+             if self.scheduler_config.async_scheduling:
+diff --git a/vllm/parser/engine/adapters.py b/vllm/parser/engine/adapters.py
+index b9c4e42..23c2883 100644
+--- a/vllm/parser/engine/adapters.py
++++ b/vllm/parser/engine/adapters.py
+@@ -60,6 +60,33 @@ class ParserEngineReasoningAdapter(ReasoningParser):
+     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+         return self._parser_engine.is_reasoning_end(list(input_ids))
+
++    def get_boundary_token_ids(self) -> frozenset[int]:
++        """Token ids that delimit reasoning and must not be FSM-advanced."""
++        engine = self._parser_engine
++        return frozenset(
++            tid
++            for tid in (
++                getattr(engine, "_reasoning_start_token_id", None),
++                getattr(engine, "_reasoning_end_token_id", None),
++            )
++            if tid is not None
++        )
++
++    def get_transition_whitespace_token_ids(self) -> frozenset[int]:
++        """Whitespace token ids that may appear around reasoning boundaries."""
++        tokenizer = self._parser_engine.model_tokenizer
++        transition: set[int] = set()
++        for text in ("\n", "\n\n", "\r\n", " ", "\t"):
++            try:
++                ids = tokenizer.encode(text)
++            except Exception:
++                continue
++            if hasattr(ids, "ids"):
++                ids = ids.ids
++            if len(ids) == 1:
++                transition.add(int(ids[0]))
++        return frozenset(transition)
++
+     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+         self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)
+
+diff --git a/vllm/reasoning/abs_reasoning_parsers.py b/vllm/reasoning/abs_reasoning_parsers.py
+index 04d6a93..92f4b83 100644
+--- a/vllm/reasoning/abs_reasoning_parsers.py
++++ b/vllm/reasoning/abs_reasoning_parsers.py
+@@ -112,6 +112,17 @@ class ReasoningParser:
+         """
+         return self.is_reasoning_end(input_ids)
+
++    def get_boundary_token_ids(self) -> frozenset[int]:
++        """Token ids that delimit reasoning and must not be FSM-advanced.
++
++        Subclasses with thinking start/end tokens should override this.
++        """
++        return frozenset()
++
++    def get_transition_whitespace_token_ids(self) -> frozenset[int]:
++        """Whitespace token ids that may appear around reasoning boundaries."""
++        return frozenset()
++
+     @abstractmethod
+     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+         """
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index c8004cb..4ee1c93 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -106,10 +106,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
+                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+             else:
+                 i_t = 0
+-            # Load state index and check for invalid entries
+-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+-                tl.int64
+-            )
++            # num_accepted_tokens is asynchronous GPU state. Keep a stale or
++            # zero count from indexing another request's state row.
++            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
++            state_idx = tl.load(
++                ssm_state_indices + i_n * stride_indices_seq + i_t,
++                mask=idx_in_row,
++                other=0,
++            ).to(tl.int64)
+             # Skip if state index is invalid (NULL_BLOCK_ID=0)
+             if state_idx <= 0:
+                 return
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+index 7e0c7e0..3391b55 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -106,10 +106,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+             else:
+                 i_t = 0
+-            # Load state index and check for invalid entries
+-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+-                tl.int64
+-            )
++            # num_accepted_tokens is asynchronous GPU state. Keep a stale or
++            # zero count from indexing another request's state row.
++            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
++            state_idx = tl.load(
++                ssm_state_indices + i_n * stride_indices_seq + i_t,
++                mask=idx_in_row,
++                other=0,
++            ).to(tl.int64)
+             # Skip if state index is invalid (NULL_BLOCK_ID=0)
+             if state_idx <= 0:
+                 return
+diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
+index 8b999c8..5fc5b3b 100644
+--- a/vllm/utils/flashinfer.py
++++ b/vllm/utils/flashinfer.py
+@@ -391,7 +391,12 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
+         return not is_prefill
+
+     # SM100/SM103 has both prefill and decode TRTLLM kernels.
+-    return current_platform.is_device_capability_family(100)
++    if current_platform.is_device_capability_family(100):
++        return True
++    # SM120: XQA decode only; prefill uses fa2 (trtllm-gen FMHA is SM100-only).
++    if current_platform.is_device_capability_family(120):
++        return not is_prefill
++    return False
+
+
+ def force_use_trtllm_attention() -> bool | None:
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 5251e25..3a3d2ce 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -404,6 +404,16 @@ class FlashInferBackend(AttentionBackend):
+     ) -> tuple[int, ...]:
+         if cache_dtype_str == "nvfp4":
+             full_dim = nvfp4_kv_cache_full_dim(head_size)
++            if current_platform.is_device_capability_family(120):
++                # SM120 reads paged NVFP4 KV with fa2 prefill / XQA decode, which
++                # need the per-head split layout. #44455 folded K/V into the
++                # content dim for trtllm-gen (SM100); for NVFP4 the last dim is
++                # [data | scale], so a 2*num_kv_heads head-group slice no longer
++                # yields the contiguous [data-block | scale-block] region that
++                # nvfp4_split_data_scale() reconstructs its views from, and
++                # attention dequantises against wrong scales (argmax collapses to
++                # token id 0). Keep SM120 on the pre-#44455 5-D layout.
++                return (num_blocks, 2, block_size, num_kv_heads, full_dim)
+             return (num_blocks, 2 * num_kv_heads, block_size, full_dim)
+         # Pack K and V in the content dim (B, H, N, 2*hs).
+         return (num_blocks, num_kv_heads, block_size, 2 * head_size)
+@@ -411,11 +421,29 @@ class FlashInferBackend(AttentionBackend):
+     @staticmethod
+     def get_kv_cache_stride_order(
+         include_num_layers_dimension: bool = False,
++        cache_dtype_str: str = "auto",
+     ) -> tuple[int, ...]:
+         # `stride_order` indicates the permutation that gets us from
+         # `get_kv_cache_shape` (logical (B, H, N, 2*hs)) to the actual memory
+         # layout we want.
+         cache_layout = get_kv_cache_layout()
++        if cache_dtype_str == "nvfp4" and current_platform.is_device_capability_family(
++            120
++        ):
++            # Matches the 5-D SM120 NVFP4 shape returned above.
++            if cache_layout == "NHD":
++                return (
++                    (1, 0, 2, 3, 4, 5)
++                    if include_num_layers_dimension
++                    else (0, 1, 2, 3, 4)
++                )
++            if cache_layout == "HND":
++                return (
++                    (1, 2, 4, 0, 3, 5)
++                    if include_num_layers_dimension
++                    else (0, 1, 3, 2, 4)
++                )
++            raise ValueError(f"Unknown cache layout format {cache_layout}.")
+         if cache_layout == "NHD" and include_num_layers_dimension:
+             # (num_blocks, num_layers, block_size, num_kv_heads, 2*head_size)
+             return (1, 0, 3, 2, 4)
+@@ -446,6 +474,9 @@ class FlashInferBackend(AttentionBackend):
+     @classmethod
+     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+         if kv_cache_dtype == "nvfp4":
++            if current_platform.is_device_capability_family(120):
++                # SM120: XQA decode (native nvfp4-KV) + fa2 prefill.
++                return supports_trtllm_attention(is_prefill=False)
+             return (
+                 current_platform.is_device_capability_family(100)
+                 and supports_trtllm_attention(is_prefill=True)
+@@ -520,6 +551,38 @@ class FlashInferDecodeKernel(Enum):
+     TRTLLM_GEN = "trtllm-gen"
+
+
++def _make_xqa_spec_decode_mask(
++    batch_size: int,
++    q_len_per_req: int,
++    device: torch.device,
++) -> torch.Tensor:
++    """Build XQA's uint16 bit-packed causal mask for uniform MTP verify."""
++    num_words = (q_len_per_req + 31) // 32
++    query_positions = torch.arange(
++        q_len_per_req, dtype=torch.int64, device=device
++    ).unsqueeze(1)
++    key_positions = torch.arange(
++        q_len_per_req, dtype=torch.int64, device=device
++    ).unsqueeze(0)
++    causal_mask = key_positions <= query_positions
++    padded_q_len = num_words * 32
++    if padded_q_len > q_len_per_req:
++        causal_mask = torch.nn.functional.pad(
++            causal_mask, (0, padded_q_len - q_len_per_req)
++        )
++    causal_mask = causal_mask.view(q_len_per_req, num_words, 32)
++    bit_positions = 1 << torch.arange(32, dtype=torch.int64, device=device)
++    packed_u32 = (
++        (causal_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
++    )
++    return (
++        packed_u32.unsqueeze(0)
++        .expand(batch_size, q_len_per_req, num_words)
++        .contiguous()
++        .view(torch.uint16)
++    )
++
++
+ @dataclass
+ class TRTLLMPrefill:
+     """Metadata for the TRTLLM prefill pathway."""
+@@ -574,6 +637,9 @@ class FlashInferTrtllmAPIDecode:
+     max_seq_len: int
+     """The maximum sequence length for KV Cache."""
+
++    spec_decode_mask: torch.Tensor | None = None
++    """Bit-packed causal mask required by multi-token XQA verification."""
++
+
+ @dataclass
+ class FlashInferMetadata:
+@@ -640,6 +706,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             None  # Wrapper for non-causal prefill (DFlash)
+         )
+         self._decode_wrapper = None  # Wrapper for decode (general shape)
++        self._xqa_spec_decode_masks: dict[tuple[int, int], torch.Tensor] = {}
+
+         if envs.VLLM_BATCH_INVARIANT:
+             self.decode_fixed_split_size = 2048
+@@ -711,7 +778,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
+             self.is_kvcache_nvfp4 = self.cache_dtype == "nvfp4"
+             if self.is_kvcache_nvfp4:
+-                if (
++                if current_platform.is_device_capability_family(120):
++                    pass  # SM120: XQA decode + fa2 prefill.
++                elif (
+                     force_use_trtllm_attention() is False
+                     or not supports_trtllm_attention(is_prefill=True)
+                     or not supports_trtllm_attention(is_prefill=False)
+@@ -772,6 +841,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         supports_spec_as_decode = (
+             self.flashinfer_trtllm_api_decode_kernel
+             == FlashInferDecodeKernel.TRTLLM_GEN
++        ) or (
++            self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
++            and current_platform.is_device_capability_family(120)
+         )
+         self._init_reorder_batch_threshold(
+             1,
+@@ -876,6 +948,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
+             return self.model_config.dtype
+         if cache_dtype == "nvfp4":
++            if current_platform.is_device_capability_family(120):
++                # SM120: fa2 prefill cannot take FP8-Q, and XQA decode requires
++                # output dtype == q dtype, so Q/O stay model dtype (bf16).
++                return self.model_config.dtype
+             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
+         return self.kv_cache_spec.dtype
+
+@@ -967,6 +1043,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
+         if current_platform.is_device_capability(90):
+             return FlashInferDecodeKernel.XQA
++        if current_platform.is_device_capability_family(120):
++            return FlashInferDecodeKernel.XQA
+         assert current_platform.is_device_capability_family(100)
+         return FlashInferDecodeKernel.TRTLLM_GEN
+
+@@ -1000,8 +1078,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 )
+             else:
+                 # NVFP4 KV cache requires the trtllm-gen backend inside
+-                # the wrapper; fa2/fa3 do not support nvfp4.
+-                backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
++                # the wrapper; fa2/fa3 do not support nvfp4. SM120 has no
++                # trtllm-gen FMHA, so it uses fa2 prefill (FlashInfer >= 0.6.15
++                # handles the strided nvfp4 KV views natively).
++                if self.is_kvcache_nvfp4:
++                    backend = (
++                        "fa2"
++                        if current_platform.is_device_capability_family(120)
++                        else "trtllm-gen"
++                    )
++                else:
++                    backend = "auto"
+                 self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                     self._get_workspace_buffer(),
+                     get_kv_cache_layout(),
+@@ -1427,7 +1514,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     # use FP8 o_data_type so the wrapper matches the
+                     # FP8 output buffer allocated in forward().
+                     o_dtype = (
+-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
++                        FP8_DTYPE
++                        if self.is_kvcache_nvfp4
++                        and not current_platform.is_device_capability_family(120)
++                        else self.model_config.dtype
+                     )
+                     prefill_wrapper.plan(
+                         qo_indptr=qo_indptr_prefill_cpu,
+@@ -1443,7 +1533,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                         window_left=self.window_left,
+                         logits_soft_cap=self.logits_soft_cap,
+                         q_data_type=self.q_data_type_prefill,
+-                        kv_data_type=self.kv_cache_dtype,
++                        kv_data_type=(
++                            torch.uint8
++                            if self.is_kvcache_nvfp4
++                            else self.kv_cache_dtype
++                        ),
+                         o_data_type=o_dtype,
+                         fixed_split_size=self.prefill_fixed_split_size,
+                         disable_split_kv=self.disable_split_kv,
+@@ -1458,6 +1552,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     f"Got {num_decode_tokens=} and {num_decodes=}."
+                 )
+                 assert self.flashinfer_trtllm_api_decode_kernel is not None
++                q_len_per_req = num_decode_tokens // num_decodes
++                spec_decode_mask = None
++                if (
++                    self.flashinfer_trtllm_api_decode_kernel
++                    == FlashInferDecodeKernel.XQA
++                    and q_len_per_req > 1
++                ):
++                    mask_key = (num_decodes, q_len_per_req)
++                    spec_decode_mask = self._xqa_spec_decode_masks.get(mask_key)
++                    if spec_decode_mask is None:
++                        spec_decode_mask = _make_xqa_spec_decode_mask(
++                            num_decodes,
++                            q_len_per_req,
++                            block_table_tensor.device,
++                        )
++                        self._xqa_spec_decode_masks[mask_key] = spec_decode_mask
+                 seq_lens_decode = seq_lens[:num_decodes]
+                 if self.use_dcp:
+                     assert common_attn_metadata.dcp_local_seq_lens is not None
+@@ -1469,6 +1579,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                     block_tables=block_table_tensor[:num_decodes],
+                     seq_lens=seq_lens_decode,
+                     max_seq_len=max_seq_len,
++                    spec_decode_mask=spec_decode_mask,
+                 )
+             else:
+                 assert seq_lens_cpu is not None
+@@ -1798,10 +1909,13 @@ class FlashInferImpl(AttentionImpl):
+             assert attn_metadata.cascade_wrapper is not None
+             stride_order = FlashInferBackend.get_kv_cache_stride_order()
+             if self.is_kvcache_nvfp4:
+-                kv_cache_views = tuple(
+-                    cache.permute(*stride_order)
+-                    for cache in kv_cache.split(self.num_kv_heads, dim=1)
+-                )
++                if current_platform.is_device_capability_family(120):
++                    kv_cache_views = (kv_cache[:, 0], kv_cache[:, 1])
++                else:
++                    kv_cache_views = tuple(
++                        cache.permute(*stride_order)
++                        for cache in kv_cache.split(self.num_kv_heads, dim=1)
++                    )
+             else:
+                 kv_perm = kv_cache.permute(*stride_order)
+                 kv_cache_views = kv_perm.split(self.head_size, dim=-1)
+@@ -1816,8 +1930,17 @@ class FlashInferImpl(AttentionImpl):
+         num_decode_tokens = attn_metadata.num_decode_tokens
+         num_prefill_tokens = attn_metadata.num_prefill_tokens
+
+-        stride_order = FlashInferBackend.get_kv_cache_stride_order()
+-        kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
++        stride_order = FlashInferBackend.get_kv_cache_stride_order(
++            cache_dtype_str=self.kv_cache_dtype
++        )
++        nvfp4_sm120 = self.is_kvcache_nvfp4 and current_platform.is_device_capability_family(
++            120
++        )
++        if nvfp4_sm120:
++            # 5-D (B, 2, N, H, full_dim): K/V are taken on the leading axis.
++            kv_cache_permute = kv_cache
++        else:
++            kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
+         # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
+         # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;
+         # CUDA TMA requires ≥16-byte alignment on all non-outermost strides.
+@@ -1840,11 +1963,17 @@ class FlashInferImpl(AttentionImpl):
+         nvfp4_kv_data = None
+         nvfp4_kv_block_scales = None
+         if self.is_kvcache_nvfp4:
+-            k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
+-            kv_cache_tuple = (
+-                canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
+-                canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
+-            )
++            if nvfp4_sm120:
++                kv_cache_tuple = (
++                    canonicalize_singleton_dim_strides(kv_cache[:, 0]),
++                    canonicalize_singleton_dim_strides(kv_cache[:, 1]),
++                )
++            else:
++                k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
++                kv_cache_tuple = (
++                    canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
++                    canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
++                )
+             k_data, k_sf = nvfp4_split_data_scale(kv_cache_tuple[0])
+             v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
+             nvfp4_kv_data = (k_data, v_data)
+@@ -1917,7 +2046,9 @@ class FlashInferImpl(AttentionImpl):
+                     # Use a pre-allocated FP8 buffer and dequantize
+                     # afterwards.
+                     needs_fp8_out_prefill = (
+-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                        self.is_kvcache_nvfp4
++                        and output.dtype != FP8_DTYPE
++                        and not current_platform.is_device_capability_family(120)
+                     )
+                     if needs_fp8_out_prefill:
+                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
+@@ -1971,7 +2102,11 @@ class FlashInferImpl(AttentionImpl):
+
+                 # NVFP4 trtllm kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and output.dtype != FP8_DTYPE
++                    and not current_platform.is_device_capability_family(120)
++                )
+                 if needs_fp8_out:
+                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
+
+@@ -2074,7 +2209,11 @@ class FlashInferImpl(AttentionImpl):
+
+                 # NVFP4 kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and output.dtype != FP8_DTYPE
++                    and not current_platform.is_device_capability_family(120)
++                )
+                 if needs_fp8_out:
+                     out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
+                 else:
+@@ -2176,7 +2315,11 @@ class FlashInferImpl(AttentionImpl):
+
+                 # NVFP4 trtllm kernel only supports FP8 output.
+                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
+-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
++                needs_fp8_out = (
++                    self.is_kvcache_nvfp4
++                    and output.dtype != FP8_DTYPE
++                    and not current_platform.is_device_capability_family(120)
++                )
+                 if needs_fp8_out:
+                     out = self._nvfp4_fp8_out[:num_decode_tokens]
+
+@@ -2187,11 +2330,6 @@ class FlashInferImpl(AttentionImpl):
+                 else:
+                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+
+-                if decode_with_xqa and q_len_per_req > 1:
+-                    raise NotImplementedError(
+-                        "FlashInfer XQA speculative decode is not wired in vLLM yet."
+-                    )
+-
+                 # XQA decode can use model-dtype Q with FP8 KV, so only include
+                 # q_scale when the decode query is actually FP8.
+                 bmm1_scale = (
+@@ -2231,6 +2369,7 @@ class FlashInferImpl(AttentionImpl):
+                     kv_layout=get_kv_cache_layout(),
+                     backend=attn_metadata.decode.kernel.value,
+                     q_len_per_req=q_len_per_req,
++                    mask=attn_metadata.decode.spec_decode_mask,
+                     kv_cache_sf=(
+                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                     ),
+@@ -2266,7 +2405,13 @@ class FlashInferImpl(AttentionImpl):
+             # and value[:num_actual_tokens] because the reshape_and_cache_flash
+             # op uses the slot_mapping's shape to determine the number of
+             # actual tokens.
+-            if self.is_kvcache_nvfp4:
++            if self.is_kvcache_nvfp4 and current_platform.is_device_capability_family(
++                120
++            ):
++                # SM120 5-D (B, 2, N, H, full_dim): K/V on the leading axis.
++                k_cache = kv_cache[:, 0]
++                v_cache = kv_cache[:, 1]
++            elif self.is_kvcache_nvfp4:
+                 # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
+                 #                            (B, N, H, full_dim));
+                 # K heads first, then V heads.
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 0b32dfc..26cd072 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -144,6 +144,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             dtype=torch.int32,
+             device=device,
+         )
++        self.spec_token_arange: torch.Tensor = torch.arange(
++            self.decode_cudagraph_max_bs * (self.num_spec + 1),
++            dtype=torch.int32,
++            device=device,
++        )
+         self.non_spec_token_indx: torch.Tensor = torch.empty(
+             (self.decode_cudagraph_max_bs * (self.num_spec + 1),),
+             dtype=torch.int32,
+@@ -255,17 +260,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                     num_spec_decodes * (self.num_spec + 1),
+                     query_start_loc_cpu[-1].item(),
+                 )
+-                spec_token_indx = torch.arange(
+-                    spec_token_size,
+-                    dtype=torch.int32,
+-                    device=query_start_loc.device,
+-                )
+-                non_spec_token_indx = torch.empty(
+-                    0, dtype=torch.int32, device=query_start_loc.device
+-                )
+-                # Filter by spec_sequence_masks to exclude padded sequences
++                spec_token_indx = self.spec_token_arange[:spec_token_size]
++                non_spec_token_indx = self.non_spec_token_indx[:0]
++                # Spec decode rows are compacted to the front; padded rows are
++                # at the back. Slice instead of CPU-mask indexing to avoid
++                # launching a tiny index kernel for every metadata build.
+                 spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
++                    :num_spec_decodes, : self.num_spec + 1
+                 ]
+                 non_spec_state_indices_tensor = None
+                 # Padded sequences are always at the back, so the first
+@@ -438,17 +439,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             spec_sequence_masks[num_spec_decodes:].fill_(False)
+
+             assert non_spec_token_indx is not None and spec_token_indx is not None
+-            self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
+-                non_spec_token_indx, non_blocking=True
+-            )
+-            non_spec_token_indx = self.non_spec_token_indx[
+-                : non_spec_token_indx.size(0)
+-            ]
++            if non_spec_token_indx.numel() > 0:
++                self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
++                    non_spec_token_indx, non_blocking=True
++                )
++                non_spec_token_indx = self.non_spec_token_indx[
++                    : non_spec_token_indx.size(0)
++                ]
+
+-            self.spec_token_indx[: spec_token_indx.size(0)].copy_(
+-                spec_token_indx, non_blocking=True
+-            )
+-            spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
++            if spec_token_indx.data_ptr() == self.spec_token_arange.data_ptr():
++                spec_token_indx = self.spec_token_arange[: spec_token_indx.size(0)]
++            else:
++                self.spec_token_indx[: spec_token_indx.size(0)].copy_(
++                    spec_token_indx, non_blocking=True
++                )
++                spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
+
+             self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
+                 spec_query_start_loc, non_blocking=True
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b4521a2..b7ee670 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -637,7 +637,9 @@ class Scheduler(SchedulerInterface):
+             token_budget -= num_new_tokens
+             req_index += 1
+
+-            # Speculative decode related.
++            # Speculative decode related. Structured-output requests schedule
++            # drafts too; update_draft_token_ids trims drafts that violate the
++            # grammar before they reach this point.
+             if request.spec_token_ids:
+                 num_scheduled_spec_tokens = (
+                     num_new_tokens
+@@ -651,9 +653,9 @@ class Scheduler(SchedulerInterface):
+                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+
+-                # New spec tokens will be set in `update_draft_token_ids` before the
+-                # next step when applicable.
+-                request.spec_token_ids = []
++            # New spec tokens will be set in `update_draft_token_ids` before the
++            # next step when applicable.
++            request.spec_token_ids = []
+
+             # Encoder-related.
+             if encoder_inputs_to_schedule:
+@@ -1829,6 +1831,11 @@ class Scheduler(SchedulerInterface):
+                         request, new_token_ids
+                     )
+                 )
++                advance_token_ids = (
++                    self.structured_output_manager.filter_tokens_for_fsm_advance(
++                        request, advance_token_ids
++                    )
++                )
+                 if advance_token_ids and not grammar.accept_tokens(
+                     req_id, advance_token_ids
+                 ):
+@@ -2159,8 +2166,15 @@ class Scheduler(SchedulerInterface):
+                     request.spec_token_ids = []
+                 continue
+
+-            # Add newly generated spec token ids to the request.
+-            if self.structured_output_manager.should_advance(request):
++            # Trim drafts that would violate the grammar before they are
++            # scheduled, so the spec window never feeds accept_tokens an
++            # invalid batch. Validation runs against the FSM state after the
++            # previous step's output, which is exactly the state the next
++            # step's bitmask rows are computed from.
++            if (
++                request.use_structured_output
++                and self.structured_output_manager.should_advance(request)
++            ):
+                 metadata = request.structured_output_request
+                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+             request.spec_token_ids = spec_token_ids
+@@ -2188,15 +2202,18 @@ class Scheduler(SchedulerInterface):
+             # Trim drafts to scheduled number of spec tokens
+             # (needed for chunked prefill case for example).
+             del spec_token_ids[orig_num_spec_tokens:]
+-            # Filter out spec tokens which do not adhere to the grammar.
++            # Count drafts that would violate the grammar (for stats) but keep
++            # the raw drafts in the output. grammar_bitmask advances through
++            # the same drafts the sampler sees in the input batch; replacing
++            # them with -1 unconstrains the rest of the window and lets
++            # grammar-invalid tokens reach accept_tokens.
++            num_invalid_tokens = 0
+             if self.structured_output_manager.should_advance(request):
+                 metadata = request.structured_output_request
+-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+-            # Pad to original number of spec tokens.
+-            num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
+-            if num_invalid_tokens:
+-                spec_token_ids.extend([-1] * num_invalid_tokens)
+-                num_invalid_spec_tokens[req_id] = num_invalid_tokens
++                validated = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
++                num_invalid_tokens = orig_num_spec_tokens - len(validated)
++                if num_invalid_tokens:
++                    num_invalid_spec_tokens[req_id] = num_invalid_tokens
+
+             sched_spec_tokens[req_id] = spec_token_ids
+
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 75cf97f..c1c3581 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1330,6 +1330,11 @@ class MambaManager(SingleTypeKVCacheManager):
+             return computed_blocks, hit_length
+
+         max_num_blocks = max_length // block_size
++        if drop_eagle_block and max_num_blocks > 0:
++            # EAGLE/MTP: the final matched Mamba page can contain recurrent
++            # state written over drafts that verification rejected. Search one
++            # page shorter so Mamba, like full attention, recomputes it.
++            max_num_blocks -= 1
+         # Search from right to left and early stop when a match is found.
+         for i in range(max_num_blocks - 1, -1, -1):
+             if cached_block := block_pool.get_cached_block(
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 08bb237..99251b6 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -15,6 +15,7 @@ from vllm.v1.structured_output.backend_guidance import GuidanceBackend
+ from vllm.v1.structured_output.backend_types import (
+     StructuredOutputBackend,
+     StructuredOutputGrammar,
++    StructuredOutputOptions,
+ )
+ from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
+
+@@ -32,6 +33,45 @@ else:
+ logger = init_logger(__name__)
+
+
++def filter_reasoning_boundary_tokens(
++    token_ids: list[int],
++    reasoner: "ReasoningParser",
++) -> list[int]:
++    """Strip reasoning boundary tokens before advancing an xgrammar FSM.
++
++    When ``reasoning=False`` structural tags exclude thinking markers, tokens
++    such as ``</think>`` and adjacent whitespace must not be passed to
++    ``accept_tokens`` even if they appear in the same MTP-accepted batch as
++    valid suffix tokens (e.g. tool-call tokens).
++    """
++    boundary_marker_ids = reasoner.get_boundary_token_ids()
++    if not boundary_marker_ids or not any(
++        token in boundary_marker_ids for token in token_ids
++    ):
++        return token_ids
++
++    transition_ids = reasoner.get_transition_whitespace_token_ids()
++    result: list[int] = []
++    i = 0
++    while i < len(token_ids):
++        token = token_ids[i]
++        if token in boundary_marker_ids:
++            i += 1
++            while i < len(token_ids) and token_ids[i] in transition_ids:
++                i += 1
++            continue
++        if token in transition_ids:
++            j = i
++            while j < len(token_ids) and token_ids[j] in transition_ids:
++                j += 1
++            if j < len(token_ids) and token_ids[j] in boundary_marker_ids:
++                i = j
++                continue
++        result.append(token)
++        i += 1
++    return result
++
++
+ class StructuredOutputManager:
+     """Engine-level manager for structured output requests."""
+
+@@ -294,6 +334,9 @@ class StructuredOutputManager:
+                 state_advancements = 0
+                 post_reasoning_end_in_window = False
+                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
++                skip_advance = self._build_fsm_advance_skip_mask(
++                    request, list(req_tokens)
++                )
+                 for i, token in enumerate(req_tokens):
+                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                     advance_grammar = apply_bitmask
+@@ -321,14 +364,14 @@ class StructuredOutputManager:
+                             apply_bitmask = True
+                             advance_grammar = False
+                             post_reasoning_end_in_window = True
+-                    if advance_grammar and not grammar.is_terminated():
++                    if (
++                        advance_grammar
++                        and not grammar.is_terminated()
++                        and (i >= len(skip_advance) or skip_advance[i])
++                    ):
+                         accepted = grammar.accept_tokens(req_id, [token])
+                         if accepted:
+                             state_advancements += 1
+-                        elif not post_reasoning_end_in_window:
+-                            raise AssertionError(
+-                                (token, req_id, scheduled_spec_decode_tokens)
+-                            )
+                     cumulative_index += 1
+                 # Diffusion LLMs don't sample a bonus token after the
+                 # scheduled positions, so skip its bitmask in that case.
+@@ -485,6 +528,54 @@ class StructuredOutputManager:
+             return new_token_ids
+         return new_token_ids[num_reasoning:]
+
++    def _should_filter_reasoning_boundary_tokens(self, request: "Request") -> bool:
++        if self.enable_in_reasoning:
++            return False
++
++        reasoner = self._get_reasoner(request)
++        if reasoner is None:
++            return False
++
++        structured_req = request.structured_output_request
++        if structured_req is None:
++            return False
++
++        return (
++            structured_req.structured_output_key[0]
++            == StructuredOutputOptions.STRUCTURAL_TAG
++        )
++
++    def filter_tokens_for_fsm_advance(
++        self, request: "Request", token_ids: list[int]
++    ) -> list[int]:
++        if not self._should_filter_reasoning_boundary_tokens(request):
++            return token_ids
++
++        reasoner = self._get_reasoner(request)
++        assert reasoner is not None
++        return filter_reasoning_boundary_tokens(token_ids, reasoner)
++
++    def _build_fsm_advance_skip_mask(
++        self, request: "Request", token_ids: list[int]
++    ) -> list[bool]:
++        if not token_ids or not self._should_filter_reasoning_boundary_tokens(
++            request
++        ):
++            return [True] * len(token_ids)
++
++        reasoner = self._get_reasoner(request)
++        assert reasoner is not None
++        filtered = filter_reasoning_boundary_tokens(token_ids, reasoner)
++        advance_mask: list[bool] = []
++        filtered_index = 0
++        for token in token_ids:
++            if filtered_index < len(filtered) and token == filtered[filtered_index]:
++                advance_mask.append(True)
++                filtered_index += 1
++            else:
++                advance_mask.append(False)
++        return advance_mask
++
+     def clear_backend(self) -> None:
+         if self.backend is not None:
+             self.backend.destroy()
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index 4f199a1..ae68ea7 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -152,22 +152,26 @@ class XgrammarGrammar(StructuredOutputGrammar):
+     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+         """Accepts a list of tokens and advances the FSM.
+
+-        Returns True if the FSM was advanced successfully.
+-        Returns False if the FSM failed to advance.
++        Returns True if all grammar-constrained tokens were accepted.
++        Tokens after termination are ignored. Returns False if the FSM
++        failed to advance.
+         """
+         if self._is_terminated:
+-            return False
++            return True
+         for token in tokens:
+             if not self.matcher.accept_token(token):
+-                logger.error(
+-                    "Failed to advance FSM for request %s "
+-                    "for tokens %s. Please file an issue.",
++                logger.debug(
++                    "Failed to advance FSM for request %s for tokens %s "
++                    "(draft-simulation/accept-path; scheduler surfaces "
++                    "real rejections).",
+                     request_id,
+                     token,
+                 )
+                 return False
+             self.num_processed_tokens += 1
+-        self._is_terminated = self.matcher.is_terminated()
++            self._is_terminated = self.matcher.is_terminated()
++            if self._is_terminated:
++                break
+         return True
+
+     def validate_tokens(self, tokens: list[int]) -> list[int]:
+@@ -176,10 +180,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
+
+         Returns the prefix list of tokens that are accepted by the FSM.
+         """
++        if self._is_terminated:
++            return []
++
+         accepted_tokens = []
+         for token in tokens:
+             if self.matcher.accept_token(token):
+                 accepted_tokens.append(token)
++                if self.matcher.is_terminated():
++                    break
+             else:
+                 break
+         if len(accepted_tokens) > 0:
+@@ -199,8 +208,9 @@ class XgrammarGrammar(StructuredOutputGrammar):
+         return self._is_terminated
+
+     def reset(self):
+-        self.num_processed_tokens = 0
+         self.matcher.reset()
++        self.num_processed_tokens = 0
++        self._is_terminated = False
+
+
+ # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 598bddf..8def6a1 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -335,7 +335,17 @@ def _reshape_kv_cache(
+
+                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
+                 try:
+-                    kv_cache_stride_order = group.backend.get_kv_cache_stride_order()
++                    try:
++                        kv_cache_stride_order = (
++                            group.backend.get_kv_cache_stride_order(
++                                cache_dtype_str=layer_cache_dtype
++                            )
++                        )
++                    except TypeError:
++                        # backend predates the cache_dtype_str kwarg
++                        kv_cache_stride_order = (
++                            group.backend.get_kv_cache_stride_order()
++                        )
+                     assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                 except (AttributeError, NotImplementedError):
+                     kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 859cec2..9b9ac27 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3707,6 +3707,8 @@ class GPUModelRunner(
+
+         # Update spec_token_ids with real draft tokens from pre step only when
+         # output_token_ids is needed (penalties or bad_words are in use).
++        # Skip the CPU draft-token copy when nothing downstream needs it:
++        # avoids a D2H copy + small kernel per decode step.
+         if self.use_async_scheduling and self._draft_token_req_ids is not None:
+             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+@@ -3915,18 +3917,24 @@ class GPUModelRunner(
+         num_tokens: int,
+         num_reqs: int,
+         force_uniform_decode: bool | None = None,
++        has_prefill: bool = False,
+     ) -> bool:
+         """
+         Checks if it's a decode batch with same amount scheduled tokens
+         across all requests.
++
++        A batch is only classified as uniform decode if shape matches AND no
++        request is still prefilling. A prompt chunk whose token count happens
++        to equal uniform_decode_query_len would otherwise replay a FULL decode
++        graph over prefill work and corrupt output (vllm-project/vllm#49918,
++        fixed upstream in #51865).
+         """
++        if force_uniform_decode is not None:
++            return force_uniform_decode
+         return (
+-            (
+-                (max_num_scheduled_tokens == uniform_decode_query_len)
+-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+-            )
+-            if force_uniform_decode is None
+-            else force_uniform_decode
++            not has_prefill
++            and (max_num_scheduled_tokens == uniform_decode_query_len)
++            and (num_tokens == max_num_scheduled_tokens * num_reqs)
+         )
+
+     def _determine_batch_execution_and_padding(
+@@ -3944,6 +3952,7 @@ class GPUModelRunner(
+         force_has_lora: bool | None = None,
+         force_num_active_loras: int | None = None,
+         num_encoder_reqs: int = 0,
++        has_prefill: bool = False,
+     ) -> tuple[
+         CUDAGraphMode,
+         BatchDescriptor,
+@@ -3957,6 +3966,7 @@ class GPUModelRunner(
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
+             force_uniform_decode=force_uniform_decode,
++            has_prefill=has_prefill,
+         )
+         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
+         # is present). Also, chunked-prefill is disabled, so batch are uniform.
+@@ -4262,6 +4272,19 @@ class GPUModelRunner(
+                     scheduler_output.num_common_prefix_blocks,
+                 )
+
++            # A batch is prefilling when any request has not yet computed its
++            # full prompt. Shape-only uniform classification would let a prompt
++            # chunk of exactly uniform_decode_query_len tokens replay a FULL
++            # decode graph over prefill work (vllm-project/vllm#49918; fixed
++            # upstream in #51865). CPU values are the same ones the scheduler
++            # used to build this batch, so this is authoritative at this point.
++            has_prefill = bool(
++                (
++                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
++                    < self.input_batch.num_prompt_tokens[:num_reqs]
++                ).any()
++            )
++
+             (
+                 cudagraph_mode,
+                 batch_desc,
+@@ -4275,6 +4298,7 @@ class GPUModelRunner(
+                 max_num_scheduled_tokens=max_num_scheduled_tokens,
+                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
++                has_prefill=has_prefill,
+             )
+
+             logger.debug(
+@@ -4607,7 +4631,6 @@ class GPUModelRunner(
+         self._draft_token_req_ids = None
+         self.valid_sampled_token_count_gpu = None
+         self.input_batch.prev_sampled_token_ids = None
+-
+         def propose_draft_token_ids(sampled_token_ids):
+             assert spec_decode_common_attn_metadata is not None
+             with record_function_or_nullcontext("gpu_model_runner: draft"):
+@@ -4711,7 +4734,9 @@ class GPUModelRunner(
+                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                 self._draft_probs = None
+                 self._draft_prob_req_ids = None
+-                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
++                self._copy_draft_token_ids_to_cpu(
++                    scheduler_output, zeros_only=True
++                )
+
+         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+             (
+@@ -7438,7 +7463,17 @@ class GPUModelRunner(
+                         cache_dtype_str=layer_cache_dtype_str,
+                     )
+                     try:
+-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
++                        try:
++                            kv_cache_stride_order = (
++                                attn_backend.get_kv_cache_stride_order(
++                                    cache_dtype_str=layer_cache_dtype_str
++                                )
++                            )
++                        except TypeError:
++                            # backend predates the cache_dtype_str kwarg
++                            kv_cache_stride_order = (
++                                attn_backend.get_kv_cache_stride_order()
++                            )
+                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                     except (AttributeError, NotImplementedError):
+                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index fd2075b..4d57d9f 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -75,14 +75,28 @@ def _copy_mamba_state_block(
+     # Widen block ids to int64 before they reach `block_id * state_block_stride`
+     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
+     # and Triton would otherwise do the multiply in int32 and wrap.
+-    dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
++    dst_col_ok = (dst_col >= 0) & (dst_col < block_table_stride_req)
++    dest_block_id = tl.load(
++        block_table_base + dst_col,
++        mask=dst_col_ok,
++        other=-1,
++    ).to(tl.int64)
++    if dest_block_id <= 0:
++        return
+     dst_addr = state_base_addr + dest_block_id * state_block_stride
+
+     is_conv_state = conv_width > 0
+
+     if CONV_STATE_DIM_FIRST and is_conv_state:
+         # DS conv layout: state_len is the slide axis; copy per dim row.
+-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
++        src_col_ok = (src_col >= 0) & (src_col < block_table_stride_req)
++        src_block_id = tl.load(
++            block_table_base + src_col,
++            mask=src_col_ok,
++            other=-1,
++        ).to(tl.int64)
++        if src_block_id <= 0:
++            return
+         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
+         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+         per_row_bytes = (conv_width - token_bias).to(tl.int64) * state_elem_size
+@@ -104,7 +118,14 @@ def _copy_mamba_state_block(
+         # SD conv: copy
+         #   state[bt[src_col], token_bias:] ->
+         #   state[bt[dst_col], :conv_width - token_bias]
+-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
++        src_col_ok = (src_col >= 0) & (src_col < block_table_stride_req)
++        src_block_id = tl.load(
++            block_table_base + src_col,
++            mask=src_col_ok,
++            other=-1,
++        ).to(tl.int64)
++        if src_block_id <= 0:
++            return
+         src_offset = token_bias.to(tl.int64) * state_inner_size * state_elem_size
+         src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
+         num_elems_to_copy = (conv_width - token_bias).to(tl.int64) * state_inner_size
+@@ -119,7 +140,17 @@ def _copy_mamba_state_block(
+         return
+
+     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
+-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
++    actual_src_col = src_col + token_bias
++    actual_src_col_ok = (actual_src_col >= 0) & (
++        actual_src_col < block_table_stride_req
++    )
++    actual_src_block_id = tl.load(
++        block_table_base + actual_src_col,
++        mask=actual_src_col_ok,
++        other=-1,
++    ).to(tl.int64)
++    if actual_src_block_id <= 0:
++        return
+     src_addr = state_base_addr + actual_src_block_id * state_block_stride
+     # Use natural block data size (inner_size * elem_size), NOT
+     # state_block_stride which is the page stride and can exceed the

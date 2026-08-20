@@ -1,0 +1,118 @@
+name: vllm-sm120-nvfp4-mtp
+
+services:
+  model-cache-init:
+    image: ${IMAGE}
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command: ["mkdir -p /home/vllm/.cache/huggingface && chown -R 2000:0 /home/vllm/.cache/huggingface"]
+    restart: "no"
+    volumes:
+      - hf-cache:/home/vllm/.cache/huggingface
+
+  server:
+    image: ${IMAGE}
+    container_name: vllm-sm120-nvfp4-mtp
+    gpus: all
+    shm_size: "8gb"
+    restart: unless-stopped
+    depends_on:
+      model-cache-init:
+        condition: service_completed_successfully
+    ports:
+      - "${BIND_ADDRESS}:${VLLM_PORT}:8000"
+    environment:
+      HF_HOME: /home/vllm/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    volumes:
+      - hf-cache:/home/vllm/.cache/huggingface
+      - ./chat-template.jinja:/opt/vllm-release/chat-template.jinja:ro
+    command:
+      - --model
+      - ${MODEL_ID}
+      - --revision
+      - ${MODEL_REVISION}
+      - --served-model-name
+      - ${SERVED_MODEL_NAME}
+      - qwen38-nvfp4-armb-mtp1-g1-fullpw-vision
+      - qwen38-nvfp4-armb-mtp1-g1-fullpw-vision-64k
+      - --quantization
+      - modelopt
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --default-chat-template-kwargs
+      - '{"enable_thinking":false,"reasoning_effort":"medium"}'
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --chat-template
+      - /opt/vllm-release/chat-template.jinja
+      - --enable-mm-embeds
+      - --limit-mm-per-prompt
+      - '{"image":0,"video":0}'
+      - --kv-cache-dtype
+      - nvfp4
+      - --kv-cache-memory-bytes
+      - "8589934592"
+      - --mamba-ssm-cache-dtype
+      - float32
+      - --max-model-len
+      - "262144"
+      - --max-num-seqs
+      - "8"
+      - --max-num-batched-tokens
+      - "4096"
+      - --long-prefill-token-threshold
+      - "2048"
+      - --scheduling-policy
+      - priority
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --spec-method
+      - mtp
+      - --spec-tokens
+      - "3"
+      - --compilation-config
+      - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,28,32]}'
+      - --attention-config
+      - '{"flash_attn_version":2}'
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 8s
+      retries: 360
+      start_period: 30s
+
+  vision:
+    image: ${IMAGE}
+    container_name: vllm-sm120-nvfp4-vision
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    entrypoint: ["python3", "/opt/vllm-release/sidecar.py"]
+    command: ["8006"]
+    ports:
+      - "${BIND_ADDRESS}:${VISION_PORT}:8006"
+    environment:
+      HF_HOME: /home/vllm/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      SIDECAR_MODEL: ${MODEL_ID}
+      SIDECAR_MODEL_REVISION: ${MODEL_REVISION}
+      SIDECAR_UPSTREAM: http://server:8000
+    volumes:
+      - hf-cache:/home/vllm/.cache/huggingface
+      - ./sidecar.py:/opt/vllm-release/sidecar.py:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/health', timeout=5)"]
+      interval: 10s
+      timeout: 8s
+      retries: 120
+      start_period: 30s
+
+volumes:
+  hf-cache:
+    name: vllm-sm120-qwen38-model-cache
