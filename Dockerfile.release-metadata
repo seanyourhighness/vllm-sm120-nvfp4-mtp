@@ -1,0 +1,17 @@
+# Metadata-only successor to the validated v0.27.1-sm120.1 runtime.
+# This creates no filesystem layer; it corrects OCI provenance/linkage and
+# records the external artifacts that compose.yaml binds to the runtime.
+FROM ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a
+
+LABEL org.opencontainers.image.source="https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp"
+LABEL org.opencontainers.image.url="https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/tag/v0.27.1-sm120.2"
+LABEL org.opencontainers.image.revision="8127e4f389cea4e18a5cbbdcc3ad57752f258893"
+LABEL org.opencontainers.image.version="v0.27.1-sm120.2"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.description="Community vLLM v0.27.1 runtime for RTX 5090: ModelOpt NVFP4 weights, NVFP4 KV cache, MTP-3, and FlashInfer XQA."
+LABEL io.github.seanyourhighness.vllm.upstream-revision="6e448d0ea9bf3d88d898b65449ca6dc2aec170ac"
+LABEL io.github.seanyourhighness.vllm.base-image-digest="sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a"
+LABEL io.github.seanyourhighness.vllm.patch-sha256="55f127c2ef353dda5dbf1af7d1efae6a792bb152ca93eda6d0609a029af284ae"
+LABEL io.github.seanyourhighness.vllm.model="gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090"
+LABEL io.github.seanyourhighness.vllm.model-revision="69274a0d8dff5dd35bcee8290612f71e03b6e981"
+LABEL io.github.seanyourhighness.vllm.chat-template-sha256="398edf5b5bb802fb6b9c9a8dba670d09f2aaeef6fdcaa0b2ca307265f59f78dc"

@@ -8,6 +8,18 @@ sha256sum --check SHA256SUMS
 bash -n build.sh launch-server.sh launch-server-nomtp.sh start.sh status.sh stop.sh verify.sh
 python3 -m py_compile sidecar.py correctness_gate.py bench/*.py
 
+release_image="$(sed -n 's/^IMAGE=//p' .env.example)"
+[[ -n "$release_image" ]]
+grep -Fq "$release_image" launch-server.sh
+grep -Fq "$release_image" launch-server-nomtp.sh
+grep -Fq '      - ${MODEL_ID}' compose.yaml
+grep -Fq '      - ${MODEL_REVISION}' compose.yaml
+grep -Fq './chat-template.jinja:/opt/vllm-release/chat-template.jinja:ro' compose.yaml
+grep -Fq '      - /opt/vllm-release/chat-template.jinja' compose.yaml
+grep -Fq 'io.github.seanyourhighness.vllm.model-revision=' Dockerfile.release-metadata
+grep -Fq 'io.github.seanyourhighness.vllm.patch-sha256=' Dockerfile.release-metadata
+grep -Fq 'io.github.seanyourhighness.vllm.chat-template-sha256=' Dockerfile.release-metadata
+
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   docker compose --env-file .env.example -f compose.yaml config --quiet
   docker compose --env-file .env.example -f compose.yaml -f compose.nomtp.yaml config --quiet
