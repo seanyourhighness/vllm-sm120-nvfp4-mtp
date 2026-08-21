@@ -37,16 +37,21 @@ Subsequent starts reuse the Docker image and the named model cache.
 
 | Component | Pinned artifact |
 |---|---|
-| Runtime | `ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a` |
-| Model | `gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090` |
-| Model revision | `69274a0d8dff5dd35bcee8290612f71e03b6e981` |
-| vLLM base | v0.27.1, commit `6e448d0ea` |
+| Release | [`v0.27.1-sm120.1`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/tag/v0.27.1-sm120.1) |
+| Runtime | [`ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp`](https://github.com/users/seanyourhighness/packages/container/package/vllm-sm120-nvfp4-mtp)`@sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a` |
+| Model + revision | [`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090@69274a0`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090/tree/69274a0d8dff5dd35bcee8290612f71e03b6e981) |
+| vLLM base | [v0.27.1 commit `6e448d0ea`](https://github.com/vllm-project/vllm/commit/6e448d0ea9bf3d88d898b65449ca6dc2aec170ac) |
 | FlashInfer | 0.6.16.post3 |
 | CUDA build | 13.0.3, SM120 only |
-| Overlay | `0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch` |
+| Overlay | [`0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch) (`sha256:55f127c2…`) |
+| Chat template | [`chat-template.jinja`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/chat-template.jinja) (`sha256:398edf5b…`) |
+| Checksums | [`SHA256SUMS`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/SHA256SUMS) |
 
 The image and model are pinned by immutable digests/revisions, not floating
-tags. The model weights are not redistributed in the runtime image.
+tags. Compose passes the pinned model revision to vLLM and mounts the shipped
+release template with `--chat-template`; this intentionally overrides the
+different template bundled with the model. The model weights are not
+redistributed in the runtime image.
 
 ## Common operations
 
