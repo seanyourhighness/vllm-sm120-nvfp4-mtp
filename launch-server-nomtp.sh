@@ -5,7 +5,7 @@
 # (source of record: GBrain vllm/2026-08-20-v0271-release-c8-corruption-ab).
 set -euo pipefail
 
-IMAGE="${1:-${IMAGE:-ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a}}"
+IMAGE="${1:-${IMAGE:-ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:8a7fcf235fccac6da98c08b6077b9cdd4b4a974822a39eee42c8cc07f83198ae}}"
 MODEL_DIR="${MODEL_DIR:-/home/sean/Models/Qwen3.8-27B-NVFP4-RTX5090}"
 PORT="${PORT:-18079}"
 CTR_NAME="${CTR_NAME:-sm120-nvfp4-mtp-nomtp}"

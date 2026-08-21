@@ -37,21 +37,25 @@ Subsequent starts reuse the Docker image and the named model cache.
 
 | Component | Pinned artifact |
 |---|---|
-| Release | [`v0.27.1-sm120.1`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/tag/v0.27.1-sm120.1) |
-| Runtime | [`ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp`](https://github.com/users/seanyourhighness/packages/container/package/vllm-sm120-nvfp4-mtp)`@sha256:fe9fc80edd0b0e2e2cb21e50c877923c4bc09d3b029cc6878df8d9cde905110a` |
+| Release | [`v0.27.1-sm120.2`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/tag/v0.27.1-sm120.2) |
+| Runtime | [`ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp`](https://github.com/users/seanyourhighness/packages/container/package/vllm-sm120-nvfp4-mtp)`@sha256:8a7fcf235fccac6da98c08b6077b9cdd4b4a974822a39eee42c8cc07f83198ae` |
 | Model + revision | [`gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090@69274a0`](https://huggingface.co/gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090/tree/69274a0d8dff5dd35bcee8290612f71e03b6e981) |
 | vLLM base | [v0.27.1 commit `6e448d0ea`](https://github.com/vllm-project/vllm/commit/6e448d0ea9bf3d88d898b65449ca6dc2aec170ac) |
 | FlashInfer | 0.6.16.post3 |
 | CUDA build | 13.0.3, SM120 only |
-| Overlay | [`0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch) (`sha256:55f127c2…`) |
-| Chat template | [`chat-template.jinja`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/chat-template.jinja) (`sha256:398edf5b…`) |
-| Checksums | [`SHA256SUMS`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.1/SHA256SUMS) |
+| Overlay | [`0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch) (`sha256:55f127c2…`) |
+| Chat template | [`chat-template.jinja`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/chat-template.jinja) (`sha256:398edf5b…`) |
+| Checksums | [`SHA256SUMS`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/SHA256SUMS) |
 
 The image and model are pinned by immutable digests/revisions, not floating
 tags. Compose passes the pinned model revision to vLLM and mounts the shipped
 release template with `--chat-template`; this intentionally overrides the
 different template bundled with the model. The model weights are not
 redistributed in the runtime image.
+
+Release `.2` is a metadata-only successor to `.1`: it preserves the exact
+runtime filesystem while correcting the OCI source/release labels and embedding
+the model revision plus patch/template checksums in the image configuration.
 
 ## Common operations
 
