@@ -27,6 +27,14 @@ PY
 if [[ "${1:-}" == "--full" ]]; then
   BASE_URL="$vision" MODEL="$SERVED_MODEL_NAME" \
     IMAGE_PATH="$ROOT/bench/vision_test_a.png" python3 correctness_gate.py
+  spec=1
+  if docker ps --format '{{.Names}}' | grep -qx 'vllm-sm120-nvfp4-nomtp'; then
+    spec=0
+  fi
+  BASE_URL="$base" MODEL="$SERVED_MODEL_NAME" EXPECT_SPEC="$spec" \
+    python3 bench/spec_gate.py
+  mode="$(grep -o '"cudagraph_mode":"[^"]*"' compose.yaml | head -n1 || true)"
+  echo "Configured cudagraph mode: ${mode:-not found in compose}"
 elif [[ "${1:-}" != "--smoke" && -n "${1:-}" ]]; then
   echo "usage: ./verify.sh [--smoke|--full]" >&2
   exit 2

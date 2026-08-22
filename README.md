@@ -24,6 +24,12 @@ cd vllm-sm120-nvfp4-mtp && ./start.sh
 the image; downloads the exact pinned model into a Docker volume; starts vLLM
 and the CPU vision sidecar; waits for health; and sends a real chat completion.
 
+On hosts with more than one GPU, set `GPU_DEVICE` in `.env` to the RTX 5090's
+index or UUID (default `0`). `start.sh` probes only that device and the compose
+stack exposes only that device to the container (`NVIDIA_VISIBLE_DEVICES`,
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`), so an older second card cannot interfere with
+device selection or enumeration.
+
 Endpoints after startup:
 
 - OpenAI-compatible vLLM API: `http://127.0.0.1:18079/v1`
@@ -62,7 +68,8 @@ the model revision plus patch/template checksums in the image configuration.
 ```bash
 ./status.sh                 # containers, health, GPU, and model-cache status
 ./verify.sh                 # fast health/model/chat checks
-./verify.sh --full          # needle, determinism, long-decode, and vision gates
+./verify.sh --full          # needle, determinism, long-decode, vision, tool-call,
+                            # non-repetition, and (MTP) spec-acceptance gates
 ./start.sh --no-mtp         # same server with speculative decoding disabled
 ./stop.sh                   # stop services; preserve the downloaded model cache
 ./stop.sh --purge-cache     # also delete the ~20.6 GB model cache
@@ -72,6 +79,22 @@ docker compose logs -f server
 To override ports or binding, copy `.env.example` to `.env` and edit it. The
 safe default binds both APIs to `127.0.0.1`. Do not expose an unauthenticated
 vLLM endpoint to the public internet.
+
+Notes from community testing:
+
+- **Agent workloads need headroom.** A healthy chat smoke is not enough for
+  agent tasks: on this stack, an independent tester scored 0/502 on a bounded
+  agent task with thinking off and `max_tokens=8192`, versus 303/502 with
+  thinking on (medium) and `max_tokens=16384`. Keep `enable_thinking=true`
+  and give agents a generous `max_tokens`.
+- **Cold-boot Hub rate limits.** The model is public and ungated, but
+  unauthenticated downloads can hit Hub rate limits on a cold start; set
+  `HF_TOKEN` in `.env` if you see warnings.
+- **Validation order.** While
+  [issue #4](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/issues/4)
+  is open, `./start.sh --no-mtp` is the documented first-validation arm.
+  `./verify.sh --full` gates the MTP profile on content quality (tool call +
+  non-repetition) and live spec-acceptance counters, not `/health` alone.
 
 ## What starts
 
@@ -93,6 +116,8 @@ forwards them to vLLM, keeping the vision tower out of VRAM.
 - Determinism: byte-identical temperature-zero output
 - Tool calls: 8/8 plus 4/4 concurrent structured arguments
 - C8 decode proof: 704.4 aggregate tok/s; all 24 streams at least 92.8 tok/s
+- MTP verify gates: tool-call, non-repetition, and spec-acceptance counters
+  (draft→accept > 0) via `./verify.sh --full`
 - Vision: 21/21 lanes through the CPU sidecar
 - Long-decode gate v2: deterministic 2/2, valid complete Python
 

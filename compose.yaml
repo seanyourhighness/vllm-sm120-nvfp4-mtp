@@ -26,6 +26,8 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       VLLM_USE_FLASHINFER_SAMPLER: "0"
+      NVIDIA_VISIBLE_DEVICES: ${GPU_DEVICE:-0}
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
     volumes:
       - hf-cache:/home/vllm/.cache/huggingface
       - ./chat-template.jinja:/opt/vllm-release/chat-template.jinja:ro
