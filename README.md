@@ -50,6 +50,7 @@ Subsequent starts reuse the Docker image and the named model cache.
 | FlashInfer | 0.6.16.post3 |
 | CUDA build | 13.0.3, SM120 only |
 | Overlay | [`0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/0001-v0271-sm120-nvfp4-kv-mtp-toolcall.patch) (`sha256:55f127c2…`) |
+| Overlay (issue #4) | `0002-v0271-mtp-lmhead-nvfp4-dequant.patch` (`sha256:db9fe07e…`) — MTP drafter loader accepts NVFP4-packed *and* BF16 lm_head; dequantizes packed heads at load, drops scale tensors, guards shape/missing-scale |
 | Chat template | [`chat-template.jinja`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/chat-template.jinja) (`sha256:398edf5b…`) |
 | Checksums | [`SHA256SUMS`](https://github.com/seanyourhighness/vllm-sm120-nvfp4-mtp/releases/download/v0.27.1-sm120.2/SHA256SUMS) |
 
