@@ -30,7 +30,7 @@ services:
       - --kv-cache-memory-bytes
       - "8589934592"
       - --mamba-ssm-cache-dtype
-      - float32
+      - bfloat16
       - --max-model-len
       - "262144"
       - --max-num-seqs

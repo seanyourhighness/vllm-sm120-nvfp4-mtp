@@ -54,7 +54,7 @@ docker run -d --gpus all -p "$PORT":8000 --name "$CTR" \
   --quantization modelopt --trust-remote-code --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --kv-cache-dtype nvfp4 --kv-cache-memory-bytes 8589934592 \
-  --mamba-ssm-cache-dtype float32 \
+  --mamba-ssm-cache-dtype bfloat16 \
   --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096 \
   --enable-prefix-caching --enable-chunked-prefill \
   --spec-method mtp --spec-tokens 3 \

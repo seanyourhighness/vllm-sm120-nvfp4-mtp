@@ -25,7 +25,7 @@ docker run -d --gpus all -p "$PORT":8000 --name "$CTR_NAME" \
   --chat-template /chat-template.jinja \
   --enable-mm-embeds --limit-mm-per-prompt '{"image":0,"video":0}' \
   --kv-cache-dtype nvfp4 --kv-cache-memory-bytes 8589934592 \
-  --mamba-ssm-cache-dtype float32 \
+  --mamba-ssm-cache-dtype bfloat16 \
   --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 4096 \
   --long-prefill-token-threshold 2048 --scheduling-policy priority \
   --enable-prefix-caching --enable-chunked-prefill \

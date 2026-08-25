@@ -67,6 +67,24 @@ launchers are in this release); MTP-3 wins clean single-stream long decode.
 The shipped defaults are the user's choice: NVFP4 KV + MTP-3 + 8-stream
 concurrency at the 8 GiB pin (~373k pool).
 
+## BF16 Mamba/SSM state default (2026-08-24)
+
+The shipped launchers/compose now default `--mamba-ssm-cache-dtype bfloat16`
+(was `float32`). Rationale, from the 2026-08-24 MTP parity run
+(`sessions/2026-08-24-mtp-parity-autotune-breakthrough`):
+
+- BF16 GDN/SSM state halves the recurrent-state block, so the same 8 GiB KV
+  pin admits a larger usable pool (~400k tokens vs ~373k under FP32 state).
+- Measured decode vs the matched FP32-state arm (MTP N3, NVFP4 KV, 8 GiB,
+  262K, prefix on): **c1 +9.0%, c3 +6.5%, c4 +0.7%, c8 +9.5%** — i.e. a ~10%
+  speed boost at the single- and 8-stream ends.
+- BF16 + prefix-on is the best balanced profile; BF16 + prefix-off and BF16 +
+  FP8 target KV (180K cap) were rejected (the latter cannot retain 262K at the
+  8 GiB reservation).
+
+This is a runtime flag only: the pinned image digest is unchanged and no
+rebuild is required. Revert by setting `--mamba-ssm-cache-dtype float32`.
+
 ## Licensing
 
 - vLLM v0.27.1: Apache-2.0. The overlay derives from it → Apache-2.0.

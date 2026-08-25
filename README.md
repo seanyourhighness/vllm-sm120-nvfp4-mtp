@@ -109,10 +109,20 @@ Text-only clients may call port 18079 directly. Clients sending `image_url`
 content should call port 8006; the sidecar computes image embeddings on CPU and
 forwards them to vLLM, keeping the vision tower out of VRAM.
 
+## BF16 Mamba/SSM state (default)
+
+The stack ships `--mamba-ssm-cache-dtype bfloat16` (was `float32`). Halving the
+GatedDeltaNet recurrent-state dtype shrinks the hybrid attention block, so the
+8 GiB KV pin admits a larger pool (~400k usable tokens vs ~373k under FP32) and
+measured decode is ~10% faster (c1 +9.0%, c8 +9.5% vs the FP32-state arm,
+2026-08-24 MTP parity run). This is a runtime flag only — the pinned image
+digest is unchanged; no rebuild is required. To revert to the FP32 state, set
+`--mamba-ssm-cache-dtype float32` in `compose.yaml` / the launchers.
+
 ## Verified release gates
 
-- Boot/config: NVFP4 KV, MTP-3, 8 GiB KV pin, 262K context, full8 graph ladder
-- KV pool: 373,797 tokens with MTP-3
+- Boot/config: NVFP4 KV, MTP-3, **BF16 Mamba/SSM state**, 8 GiB KV pin, 262K context, full8 graph ladder
+- KV pool: ~400k usable tokens with MTP-3 + BF16 SSM state (8 GiB pin)
 - Needle-32K: 9/9 cold and prefix-cached replay
 - Determinism: byte-identical temperature-zero output
 - Tool calls: 8/8 plus 4/4 concurrent structured arguments
