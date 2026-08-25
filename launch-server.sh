@@ -3,7 +3,7 @@
 # canonical verified flags (8 GiB KV pin, 8 streams, 262k, vision offloaded).
 set -euo pipefail
 
-IMAGE="${1:-${IMAGE:-ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:8a7fcf235fccac6da98c08b6077b9cdd4b4a974822a39eee42c8cc07f83198ae}}"
+IMAGE="${1:-${IMAGE:-ghcr.io/seanyourhighness/vllm-sm120-nvfp4-mtp@sha256:506d9a1ab859f4accb75f3fdb881644917a8704e3bda39a10df8de65ffc61297}}"
 MODEL_DIR="${MODEL_DIR:-/home/sean/Models/Qwen3.8-27B-NVFP4-RTX5090}"
 PORT="${PORT:-18079}"
 CTR_NAME="${CTR_NAME:-sm120-nvfp4-mtp}"
